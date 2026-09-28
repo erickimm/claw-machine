@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Claw machine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#3A3935; --muted:#8C877D;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+*,*::before,*::after{box-sizing:inherit}
+html,body{height:100%;margin:0;background:#FFFFFF;color-scheme:light}
+body{color:var(--ink);font-family:"Newsreader",Georgia,"Times New Roman",serif;overflow:hidden;-webkit-font-smoothing:antialiased}
+canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;display:block}
+header{position:fixed;top:calc(28px + env(safe-area-inset-top,0px));left:36px;right:36px;display:flex;justify-content:space-between;align-items:baseline;gap:24px;z-index:2;pointer-events:none}
+header>*{pointer-events:auto}
+.id h1{font-size:1.25rem;font-weight:500;margin:0;letter-spacing:.005em}
+.id p{margin:.2rem 0 0;font-size:.98rem;color:var(--muted);font-style:italic;max-width:34ch;line-height:1.4}
+nav{display:flex;gap:28px;font-size:1rem}
+nav a{color:var(--ink);text-decoration:none;border-bottom:1px solid transparent;padding-bottom:2px}
+nav a:hover,nav a:focus-visible{border-bottom-color:currentColor;outline:none}
+.say{position:fixed;transform:translate(-50%,-100%) scale(.92);font-size:1rem;font-style:italic;color:#4E4A44;background:rgba(255,255,255,0.95);box-shadow:0 4px 16px rgba(60,40,30,.12);padding:3px 12px 4px;border-radius:12px;opacity:0;transition:opacity .2s,transform .25s;pointer-events:none;z-index:3;white-space:nowrap}
+.say.show{opacity:1;transform:translate(-50%,-100%) scale(1)}
+@media (max-width:640px){ header{left:20px;right:20px;flex-direction:column;gap:10px} }
+</style>
+</head>
+<body>
+<canvas id="scene" role="img" aria-label="A claw machine. Move the pointer to aim the claw, click to drop it and try to win a prize. Arrow keys and space also work."></canvas>
+<div id="msg" class="say"></div>
+
+
+<script>
+(() => {
+const cvs = document.getElementById('scene'), ctx = cvs.getContext('2d');
+const msgEl = document.getElementById('msg');
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const clamp = (v,a,b) => v<a?a:v>b?b:v;
+const rnd = (a,b) => a+Math.random()*(b-a);
+const pick = a => a[Math.floor(Math.random()*a.length)];
+
+let W, H, dpr;
+let M = {};            // machine layout
+let grainC;
+
+/* ---------- world: x in [-1,1] left-right, z in [0,1] front-back, y = height ---------- */
+const YTOP = 0.85, CHUTE = { x0:-1, x1:-0.6, z0:0, z1:0.3, h:0.2 };
+const DROP_AT = { x:-0.8, z:0.15 };
+function proj(x,y,z){
+  const f = 1 - 0.28*z;
+  return { x: M.cx + x*M.hw*f, y: M.fy + (M.by - M.fy)*z - y*M.vs*f, s: M.hw*f };
+}
+function unproj(px,py){
+  const z = clamp((py - M.fy)/(M.by - M.fy), 0.05, 0.95);
+  const f = 1 - 0.28*z;
+  return { x: clamp((px - M.cx)/(M.hw*f), -0.92, 0.92), z };
+}
+const inChute = (x,z,pad=0) => x < CHUTE.x1+pad && z < CHUTE.z1+pad;
+
+/* ---------- prizes ---------- */
+const KINDS = {
+  bear:   { name:'bear',   col:'#B9875F' },
+  bunny:  { name:'bunny',  col:'#F3E4E6' },
+  duck:   { name:'duck',   col:'#F2CC4E' },
+  frog:   { name:'frog',   col:'#8CC17A' },
+  cat:    { name:'cat',    col:'#9FA3AE' },
+  capsule:{ name:'capsule',col:'#E37B72' },
+  ghost:  { name:'ghost',  col:'#F7F7FA' },
+  golden: { name:'golden duck', col:'#E3B341', rare:true }
+};
+let prizes = [];
+function makePrize(x,z,y){
+  const kind = Math.random() < 0.05 ? 'golden' : pick(['bear','bunny','duck','frog','cat','capsule','ghost']);
+  const r = kind === 'capsule' ? rnd(0.09,0.1) : rnd(0.1,0.12);
+  return { kind, x, z, y: y||0, vy:0, vx:0, vz:0, r, h: r*1.1, rot: rnd(-0.5,0.5), held:false, falling: !!y, gone:false, win:false, bump:0 };
+}
+function fillPrizes(n){
+  prizes = [];
+  for (let i=0;i<n;i++){
+    let x, z; do { x = rnd(-0.85,0.85); z = rnd(0.08,0.92); } while (inChute(x,z,0.12));
+    prizes.push(makePrize(x,z));
+  }
+  for (let k=0;k<300;k++) separate(1);
+}
+function separate(dt){
+  const floor = prizes.filter(p => !p.held && !p.falling && !p.gone);
+  for (let i=0;i<floor.length;i++){
+    const a = floor[i];
+    for (let j=i+1;j<floor.length;j++){
+      const b = floor[j];
+      const dx = b.x-a.x, dz = b.z-a.z, d = Math.hypot(dx,dz)||0.001, min = (a.r+b.r)*0.92;
+      if (d < min){
+        const push = (min-d)/2, nx = dx/d, nz = dz/d;
+        a.x -= nx*push; a.z -= nz*push; b.x += nx*push; b.z += nz*push;
+      }
+    }
+  }
+  for (const p of floor){
+    p.x += p.vx*dt; p.z += p.vz*dt; p.vx *= 0.9; p.vz *= 0.9;
+    p.x = clamp(p.x, -1+p.r*0.8, 1-p.r*0.8); p.z = clamp(p.z, p.r*0.6, 1-p.r*0.6);
+    if (inChute(p.x,p.z,p.r*0.7)){   // keep prizes out of the chute box
+      const ex = CHUTE.x1+p.r*0.7 - p.x, ez = CHUTE.z1+p.r*0.7 - p.z;
+      if (ex < ez) p.x += ex; else p.z += ez;
+    }
+  }
+}
+function surf(x,z){
+  let h = 0;
+  for (const p of prizes){
+    if (p.held || p.falling || p.gone) continue;
+    const d = Math.hypot(x-p.x, z-p.z);
+    if (d < p.r) h = Math.max(h, p.h*Math.sqrt(1-(d/p.r)*(d/p.r)));
+  }
+  return h;
+}
+
+/* ---------- claw ---------- */
+const C = { x:0, z:0.55, tx:0, tz:0.55, vx:0, vz:0, y:YTOP, open:1, state:'idle', t:0, held:null, slip:null, swx:0, swz:0, svx:0, svz:0, press:0 };
+let fails = 0, shelf = [], flash = 0;
+let tries = 2, coinAnim = -1, slotNudge = 0, triesPulse = 0;
+function drop(){
+  if (C.state !== 'idle') return;
+  if (tries <= 0){ slotNudge = 0.6; say('insert a coin', 1.4); return; }
+  tries--; triesPulse = 0.4;
+  C.state = 'down'; C.press = 1;
+}
+function insertCoin(){
+  if (coinAnim >= 0) return;
+  coinAnim = 0;
+}
+function slotRect(){
+  const py = M.py, ph = M.y + M.h - M.w*0.07 - py;
+  return { x: M.x+M.w*0.40, y: py+ph*0.12, w: M.w*0.15, h: ph*0.76 };
+}
+const inRect = (px,py,r) => px >= r.x && px <= r.x+r.w && py >= r.y && py <= r.y+r.h;
+function decideGrab(){
+  let best = null, bd = 1e9;
+  for (const p of prizes){
+    if (p.held || p.falling || p.gone) continue;
+    const d = Math.hypot(C.x-p.x, C.z-p.z);
+    if (d < p.r + 0.03 && d < bd){ best = p; bd = d; }
+  }
+  if (!best){
+    // closed on nothing: nudge whatever was close
+    for (const p of prizes){ const d = Math.hypot(C.x-p.x, C.z-p.z); if (d < 0.2 && !p.held){ p.vx += (p.x-C.x)/d*0.4; p.vz += (p.z-C.z)/d*0.4; } }
+    return;
+  }
+  best.held = true; C.held = best;
+  const centered = bd < best.r*0.55;
+  const win = Math.random() < (centered ? 0.22 : 0.08) || fails >= 7;
+  if (win) C.slip = null;
+  else C.slip = Math.random() < 0.5 ? { phase:'up', at: rnd(0.3,0.85) } : { phase:'carry', at: rnd(0.25,0.85) };
+}
+function release(p, dramatic){
+  p.held = false; p.falling = true; p.vy = 0;
+  p.vx = rnd(-0.3,0.3); p.vz = rnd(-0.2,0.2); p.rot += rnd(-1,1);
+  C.held = null;
+  if (dramatic) say('so close\u2026', 1.2);
+}
+
+/* ---------- messages ---------- */
+let msgT = 0;
+function say(t, dur){ msgEl.textContent = t; msgEl.classList.add('show'); msgT = dur || 1.8; }
+
+/* ---------- layout ---------- */
+function layout(){
+  dpr = Math.min(window.devicePixelRatio||1, 2);
+  W = innerWidth; H = innerHeight;
+  cvs.width = W*dpr; cvs.height = H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  const top = 44;
+  const mw = Math.max(260, Math.min(520, W*0.86, (H-top-90)/1.32));
+  M.w = mw; M.h = mw*1.32; M.x = (W-mw)/2; M.y = top + Math.max(0,(H-top-90-M.h)/2);
+  M.wx = M.x+mw*0.07; M.wy = M.y+mw*0.16; M.ww = mw*0.86; M.wh = mw*0.84;
+  M.cx = M.wx + M.ww/2; M.hw = M.ww*0.46; M.fy = M.wy + M.wh*0.94; M.by = M.wy + M.wh*0.36; M.vs = M.hw*0.42;
+  M.py = M.wy + M.wh + mw*0.03;               // control panel top
+  M.shelfY = M.y + M.h + 36;
+  msgEl.style.left = (M.x+M.w/2)+'px'; msgEl.style.top = (M.y - 8)+'px';
+  // grain for the cabinet
+  grainC = document.createElement('canvas');
+  grainC.width = Math.ceil(M.w*dpr); grainC.height = Math.ceil(M.h*dpr);
+  const g = grainC.getContext('2d'), im = g.createImageData(grainC.width, grainC.height), d = im.data;
+  for (let i=0;i<d.length;i+=4){ const v = Math.random() < 0.5 ? 20 : 255; d[i]=d[i+1]=d[i+2]=v; d[i+3]=Math.random()*(v===20?30:34); }
+  g.putImageData(im,0,0);
+}
+let rt; addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(layout,150); });
+
+/* ---------- input ---------- */
+addEventListener('pointermove', e => {
+  const overSlot = inRect(e.clientX, e.clientY, slotRect());
+  cvs.style.cursor = overSlot ? 'pointer' : 'default';
+  if (overSlot) return;
+  const t = unproj(e.clientX, e.clientY); C.tx = t.x; C.tz = t.z;
+});
+addEventListener('pointerdown', e => {
+  if (e.target.closest('a')) return;
+  if (inRect(e.clientX, e.clientY, slotRect())){ insertCoin(); return; }
+  const t = unproj(e.clientX, e.clientY); C.tx = t.x; C.tz = t.z;
+  drop();
+});
+const keys = {};
+addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter'){ e.preventDefault(); drop(); }
+  if (e.code === 'KeyC') insertCoin();
+  keys[e.code] = true;
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+/* ---------- drawing helpers ---------- */
+function quad(a,b,c,d,fill){ ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y); ctx.closePath(); ctx.fillStyle = fill; ctx.fill(); }
+function drawPrizeShape(kind, R){
+  const k = KINDS[kind], c = ctx;
+  const eye = (x,y) => { c.fillStyle = '#2B2A28'; c.beginPath(); c.arc(x*R,y*R,R*0.09,0,6.283); c.fill(); };
+  if (kind === 'bear'){
+    c.fillStyle = k.col; c.beginPath(); c.arc(-0.62*R,-0.68*R,R*0.34,0,6.283); c.arc(0.62*R,-0.68*R,R*0.34,0,6.283); c.fill();
+    c.fillStyle = '#D9B08C'; c.beginPath(); c.arc(-0.62*R,-0.68*R,R*0.17,0,6.283); c.arc(0.62*R,-0.68*R,R*0.17,0,6.283); c.fill();
+    c.fillStyle = k.col; c.beginPath(); c.arc(0,0,R,0,6.283); c.fill();
+    c.fillStyle = '#E3C4A4'; c.beginPath(); c.ellipse(0,0.3*R,R*0.38,R*0.28,0,0,6.283); c.fill();
+    eye(-0.32,-0.12); eye(0.32,-0.12); c.fillStyle = '#2B2A28'; c.beginPath(); c.ellipse(0,0.2*R,R*0.1,R*0.07,0,0,6.283); c.fill();
+  } else if (kind === 'bunny'){
+    c.fillStyle = k.col; c.beginPath(); c.ellipse(-0.35*R,-1.05*R,R*0.2,R*0.55,-0.15,0,6.283); c.ellipse(0.35*R,-1.05*R,R*0.2,R*0.55,0.15,0,6.283); c.fill();
+    c.fillStyle = '#EFB8C0'; c.beginPath(); c.ellipse(-0.35*R,-1.05*R,R*0.09,R*0.38,-0.15,0,6.283); c.ellipse(0.35*R,-1.05*R,R*0.09,R*0.38,0.15,0,6.283); c.fill();
+    c.fillStyle = k.col; c.beginPath(); c.arc(0,0,R,0,6.283); c.fill();
+    c.fillStyle = 'rgba(239,150,165,0.5)'; c.beginPath(); c.arc(-0.5*R,0.2*R,R*0.16,0,6.283); c.arc(0.5*R,0.2*R,R*0.16,0,6.283); c.fill();
+    eye(-0.3,-0.08); eye(0.3,-0.08);
+  } else if (kind === 'duck' || kind === 'golden'){
+    c.fillStyle = k.col; c.beginPath(); c.arc(0,0,R,0,6.283); c.fill();
+    c.fillStyle = '#EE8A3C'; c.beginPath(); c.ellipse(0,0.3*R,R*0.36,R*0.2,0,0,6.283); c.fill();
+    eye(-0.35,-0.2); eye(0.35,-0.2);
+    if (kind === 'golden'){ c.fillStyle = 'rgba(255,255,255,0.7)'; c.beginPath(); c.ellipse(-0.35*R,-0.5*R,R*0.25,R*0.12,-0.6,0,6.283); c.fill(); }
+  } else if (kind === 'frog'){
+    c.fillStyle = k.col; c.beginPath(); c.arc(-0.45*R,-0.72*R,R*0.32,0,6.283); c.arc(0.45*R,-0.72*R,R*0.32,0,6.283); c.arc(0,0,R,0,6.283); c.fill();
+    c.fillStyle = '#FFFFFF'; c.beginPath(); c.arc(-0.45*R,-0.74*R,R*0.2,0,6.283); c.arc(0.45*R,-0.74*R,R*0.2,0,6.283); c.fill();
+    eye(-0.45,-0.74); eye(0.45,-0.74);
+    c.strokeStyle = '#3E5E36'; c.lineWidth = R*0.08; c.beginPath(); c.arc(0,0.05*R,R*0.45,0.25,Math.PI-0.25); c.stroke();
+  } else if (kind === 'cat'){
+    c.fillStyle = k.col;
+    c.beginPath(); c.moveTo(-0.85*R,-0.3*R); c.lineTo(-0.7*R,-1.1*R); c.lineTo(-0.2*R,-0.85*R); c.closePath(); c.fill();
+    c.beginPath(); c.moveTo(0.85*R,-0.3*R); c.lineTo(0.7*R,-1.1*R); c.lineTo(0.2*R,-0.85*R); c.closePath(); c.fill();
+    c.beginPath(); c.arc(0,0,R,0,6.283); c.fill();
+    eye(-0.32,-0.1); eye(0.32,-0.1);
+    c.strokeStyle = 'rgba(40,40,40,0.5)'; c.lineWidth = R*0.04;
+    c.beginPath(); c.moveTo(-0.2*R,0.25*R); c.lineTo(-0.75*R,0.18*R); c.moveTo(-0.2*R,0.32*R); c.lineTo(-0.72*R,0.4*R); c.moveTo(0.2*R,0.25*R); c.lineTo(0.75*R,0.18*R); c.moveTo(0.2*R,0.32*R); c.lineTo(0.72*R,0.4*R); c.stroke();
+    c.fillStyle = '#E79AA0'; c.beginPath(); c.arc(0,0.18*R,R*0.07,0,6.283); c.fill();
+  } else if (kind === 'capsule'){
+    c.fillStyle = 'rgba(245,248,252,0.95)'; c.beginPath(); c.arc(0,0,R,0,6.283); c.fill();
+    c.fillStyle = k.col; c.beginPath(); c.arc(0,0,R,Math.PI,0); c.closePath(); c.fill();
+    c.strokeStyle = 'rgba(0,0,0,0.15)'; c.lineWidth = R*0.06; c.beginPath(); c.moveTo(-R,0); c.lineTo(R,0); c.stroke();
+    c.fillStyle = 'rgba(255,255,255,0.6)'; c.beginPath(); c.ellipse(-0.4*R,-0.5*R,R*0.25,R*0.12,-0.6,0,6.283); c.fill();
+  } else if (kind === 'ghost'){
+    c.fillStyle = k.col; c.beginPath(); c.arc(0,-0.1*R,R,Math.PI,0);
+    for (let i=0;i<=4;i++){ const xx = R - i*R*0.5; c.quadraticCurveTo(xx-R*0.12, 1.05*R, xx-R*0.25, 0.8*R); }
+    c.closePath(); c.fill();
+    eye(-0.3,-0.15); eye(0.3,-0.15);
+    c.fillStyle = 'rgba(239,150,165,0.45)'; c.beginPath(); c.arc(-0.52*R,0.12*R,R*0.13,0,6.283); c.arc(0.52*R,0.12*R,R*0.13,0,6.283); c.fill();
+  }
+}
+function drawPrize(p, T){
+  const base = proj(p.x, 0, p.z);
+  if (!p.held){
+    const hgt = p.y;
+    ctx.fillStyle = `rgba(60,40,60,${(0.22 - Math.min(0.15, hgt*0.3)).toFixed(3)})`;
+    ctx.beginPath(); ctx.ellipse(base.x, base.y+base.s*p.r*0.35, base.s*p.r*1.05, base.s*p.r*0.45, 0, 0, 6.283); ctx.fill();
+  }
+  const c = proj(p.x, p.y + p.h*0.55, p.z);
+  const R = c.s*p.r*(1 + p.y*0.12);
+  ctx.save(); ctx.translate(c.x, c.y);
+  let rot = p.rot; if (p.held && !reduce) rot += Math.sin(T*0.008)*0.12;
+  ctx.rotate(rot);
+  if (p.win){ const k = 1 - clamp(p.winT/0.5,0,1); ctx.scale(k,k); }
+  drawPrizeShape(p.kind, R);
+  if (p.kind === 'golden' && !reduce){
+    ctx.fillStyle = 'rgba(255,248,210,0.9)';
+    for (let i=0;i<3;i++){ const a = T*0.003 + i*2.1; ctx.beginPath(); ctx.arc(Math.cos(a)*R*1.3, Math.sin(a)*R*1.3, R*0.08, 0, 6.283); ctx.fill(); }
+  }
+  ctx.restore();
+}
+function drawClawShadow(){
+  if (C.state === 'carry' || C.state === 'release') return;
+  const x = C.x + C.swx*0.6, z = C.z + C.swz*0.6;
+  const s = surf(x, z), gap = clamp((C.y - s)/YTOP, 0, 1);
+  const p = proj(x, s, z);
+  const rr = (0.05 + 0.06*gap)*p.s;
+  const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, rr);
+  const a = 0.55 - 0.2*gap;
+  g.addColorStop(0, `rgba(40,20,50,${a.toFixed(3)})`); g.addColorStop(1, 'rgba(40,20,50,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(p.x, p.y, rr, rr*0.6, 0, 0, 6.283); ctx.fill();
+}
+function drawGantry(){
+  const y = YTOP + 0.16;
+  ctx.strokeStyle = '#8C9199'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  const l = proj(-1, y, C.z), r = proj(1, y, C.z);
+  ctx.strokeStyle = '#6F757E'; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(l.x,l.y); ctx.lineTo(r.x,r.y); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(l.x,l.y-1.5); ctx.lineTo(r.x,r.y-1.5); ctx.stroke();
+  const cc = proj(C.x, y, C.z);
+  ctx.fillStyle = '#4F545B'; ctx.beginPath(); ctx.roundRect(cc.x-cc.s*0.09, cc.y-cc.s*0.055, cc.s*0.18, cc.s*0.11, 4); ctx.fill();
+}
+function drawClaw(T){
+  const top = proj(C.x, YTOP+0.16, C.z);
+  const hx = C.x + C.swx, hz = C.z + C.swz, hy = C.y + 0.07;
+  const hub = proj(hx, hy, hz);
+  ctx.strokeStyle = '#5B6068'; ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.moveTo(top.x, top.y); ctx.lineTo(hub.x, hub.y); ctx.stroke();
+  if (C.held) drawPrize(C.held, T);
+  // three prongs around the hub
+  const spread = 0.05 + 0.1*C.open;
+  ctx.lineCap = 'round';
+  for (let i=0;i<3;i++){
+    const a = Math.PI/2 + i*2.094;
+    const mid = proj(hx + Math.cos(a)*spread, hy - 0.03, hz + Math.sin(a)*spread*0.9);
+    const tip = proj(hx + Math.cos(a)*spread*0.5, C.y, hz + Math.sin(a)*spread*0.5*0.9);
+    ctx.strokeStyle = '#7B818A'; ctx.lineWidth = Math.max(3.5, hub.s*0.03);
+    ctx.beginPath(); ctx.moveTo(hub.x, hub.y); ctx.lineTo(mid.x, mid.y); ctx.lineTo(tip.x, tip.y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(hub.x, hub.y); ctx.lineTo(mid.x, mid.y); ctx.stroke();
+  }
+  const hr = hub.s*0.065*(1 + C.y*0.15);
+  ctx.fillStyle = '#6A7079'; ctx.beginPath(); ctx.arc(hub.x, hub.y, hr, 0, 6.283); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.beginPath(); ctx.arc(hub.x-hr*0.3, hub.y-hr*0.3, hr*0.4, 0, 6.283); ctx.fill();
+}
+function drawChute(){
+  const h = CHUTE.h;
+  const a = proj(CHUTE.x0,0,CHUTE.z0), b = proj(CHUTE.x1,0,CHUTE.z0), c = proj(CHUTE.x1,0,CHUTE.z1), d = proj(CHUTE.x0,0,CHUTE.z1);
+  quad(a,b,c,d,'#2E2A33');
+  const at = proj(CHUTE.x0,h,CHUTE.z0), bt = proj(CHUTE.x1,h,CHUTE.z0), ct = proj(CHUTE.x1,h,CHUTE.z1), dt = proj(CHUTE.x0,h,CHUTE.z1);
+  quad(d,c,ct,dt,'rgba(200,230,242,0.5)');
+  quad(b,c,ct,bt,'rgba(200,230,242,0.45)');
+  quad(a,b,bt,at,'rgba(200,230,242,0.4)');
+  ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 3; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(at.x,at.y); ctx.lineTo(bt.x,bt.y); ctx.lineTo(ct.x,ct.y); ctx.lineTo(dt.x,dt.y); ctx.stroke();
+  ctx.strokeStyle = 'rgba(150,190,210,0.6)'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(bt.x,bt.y); ctx.lineTo(b.x,b.y); ctx.moveTo(ct.x,ct.y); ctx.lineTo(c.x,c.y); ctx.stroke();
+}
+function drawInterior(T){
+  ctx.save();
+  ctx.beginPath(); ctx.roundRect(M.wx, M.wy, M.ww, M.wh, 10); ctx.clip();
+  // back wall and side walls
+  const bl = proj(-1,0,1), br = proj(1,0,1), fl = proj(-1,0,0), fr = proj(1,0,0);
+  const wg = ctx.createLinearGradient(0, M.wy, 0, bl.y);
+  wg.addColorStop(0,'#BFDCD0'); wg.addColorStop(1,'#D5E9E0');
+  ctx.fillStyle = wg; ctx.fillRect(M.wx, M.wy, M.ww, bl.y - M.wy + 1);
+  ctx.fillStyle = '#B3D2C5'; ctx.beginPath(); ctx.moveTo(M.wx,M.wy); ctx.lineTo(bl.x,bl.y); ctx.lineTo(fl.x,fl.y); ctx.lineTo(M.wx,M.wy+M.wh); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(M.wx+M.ww,M.wy); ctx.lineTo(br.x,br.y); ctx.lineTo(fr.x,fr.y); ctx.lineTo(M.wx+M.ww,M.wy+M.wh); ctx.closePath(); ctx.fill();
+  // floor
+  const fg = ctx.createLinearGradient(0, bl.y, 0, fl.y);
+  fg.addColorStop(0,'#D8D0E4'); fg.addColorStop(1,'#E6DFEE');
+  quad(bl,br,fr,fl,fg);
+  // prizes back-to-front, chute slotted in by depth
+  const list = prizes.filter(p => !p.held && !p.gone).sort((a,b) => b.z - a.z);
+  let chuteDrawn = false;
+  for (const p of list){
+    if (!chuteDrawn && p.z < CHUTE.z1){ drawChute(); chuteDrawn = true; }
+    drawPrize(p, T);
+  }
+  if (!chuteDrawn) drawChute();
+  drawClawShadow();
+  drawGantry();
+  drawClaw(T);
+  // glass reflections
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath(); ctx.moveTo(M.wx+M.ww*0.08, M.wy); ctx.lineTo(M.wx+M.ww*0.2, M.wy); ctx.lineTo(M.wx+M.ww*0.02, M.wy+M.wh*0.45); ctx.lineTo(M.wx, M.wy+M.wh*0.45); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(M.wx+M.ww*0.26, M.wy); ctx.lineTo(M.wx+M.ww*0.3, M.wy); ctx.lineTo(M.wx+M.ww*0.1, M.wy+M.wh*0.5); ctx.lineTo(M.wx+M.ww*0.06, M.wy+M.wh*0.5); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawCabinet(T){
+  const { x, y, w, h } = M;
+  ctx.fillStyle = 'rgba(60,40,40,0.1)';
+  ctx.beginPath(); ctx.ellipse(x+w/2, y+h+6, w*0.52, 10, 0, 0, 6.283); ctx.fill();
+  ctx.fillStyle = '#E58C7C'; ctx.beginPath(); ctx.roundRect(x, y, w, h, w*0.05); ctx.fill();
+  ctx.fillStyle = '#CF7667'; ctx.fillRect(x+w*0.03, y+h-w*0.05, w*0.94, w*0.04);
+  // marquee with chasing bulbs
+  const mx = x+w*0.07, my = y+w*0.025, mw = w*0.86, mh = w*0.1;
+  ctx.fillStyle = '#FFF1DA'; ctx.beginPath(); ctx.roundRect(mx, my, mw, mh, mh*0.45); ctx.fill();
+  ctx.fillStyle = '#C8604F'; ctx.font = `italic 500 ${Math.round(mh*0.55)}px Newsreader, Georgia, serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('prizes inside', mx+mw/2, my+mh*0.54);
+  const n = 18, step = Math.floor(T/160);
+  for (let i=0;i<n;i++){
+    const bx = mx + mh*0.3 + (mw - mh*0.6)*i/(n-1);
+    for (const by of [my - w*0.012, my + mh + w*0.012]){
+      const lit = flash > 0 ? (step%2===0) : ((i + step) % 3 === 0);
+      ctx.fillStyle = lit ? '#FFD66B' : '#F2B9A6';
+      ctx.beginPath(); ctx.arc(bx, by, w*0.009, 0, 6.283); ctx.fill();
+      if (lit){ ctx.fillStyle = 'rgba(255,214,107,0.25)'; ctx.beginPath(); ctx.arc(bx, by, w*0.02, 0, 6.283); ctx.fill(); }
+    }
+  }
+  // window frame
+  ctx.fillStyle = '#C96E60'; ctx.beginPath(); ctx.roundRect(M.wx-5, M.wy-5, M.ww+10, M.wh+10, 13); ctx.fill();
+  drawInterior(T);
+  // control panel: joystick tilts toward where the claw is heading, button sinks on drop
+  const py = M.py, ph = y + h - w*0.07 - py;
+  ctx.fillStyle = '#F2A493'; ctx.beginPath(); ctx.roundRect(x+w*0.07, py, w*0.86, ph, 10); ctx.fill();
+  const jx = x+w*0.62, jy = py+ph*0.55;
+  ctx.fillStyle = '#3A3538'; ctx.beginPath(); ctx.ellipse(jx, jy, w*0.045, w*0.018, 0, 0, 6.283); ctx.fill();
+  const tiltX = clamp((C.tx - C.x)*3, -1, 1)*w*0.03, tiltY = clamp(-(C.tz - C.z)*3, -1, 1)*w*0.02;
+  ctx.strokeStyle = '#3A3538'; ctx.lineWidth = w*0.012; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(jx, jy); ctx.lineTo(jx+tiltX, jy-w*0.06+tiltY); ctx.stroke();
+  ctx.fillStyle = '#D9453B'; ctx.beginPath(); ctx.arc(jx+tiltX, jy-w*0.065+tiltY, w*0.024, 0, 6.283); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.beginPath(); ctx.arc(jx+tiltX-w*0.008, jy-w*0.072+tiltY, w*0.007, 0, 6.283); ctx.fill();
+  const bx2 = x+w*0.8, by2 = py+ph*0.5, sink = C.press*w*0.008;
+  ctx.fillStyle = '#B94C3F'; ctx.beginPath(); ctx.ellipse(bx2, by2+w*0.01, w*0.04, w*0.022, 0, 0, 6.283); ctx.fill();
+  ctx.fillStyle = '#F2C94C'; ctx.beginPath(); ctx.ellipse(bx2, by2+sink, w*0.036, w*0.019, 0, 0, 6.283); ctx.fill();
+  // tries display and coin slot
+  const sr = slotRect(), nudge = slotNudge > 0 ? Math.sin(slotNudge*40)*w*0.006 : 0;
+  ctx.save(); ctx.translate(nudge, 0);
+  ctx.fillStyle = '#D98676'; ctx.beginPath(); ctx.roundRect(sr.x, sr.y, sr.w, sr.h, 6); ctx.fill();
+  const lcdH = sr.h*0.38;
+  ctx.fillStyle = '#2B2528'; ctx.beginPath(); ctx.roundRect(sr.x+sr.w*0.1, sr.y+sr.h*0.08, sr.w*0.8, lcdH, 4); ctx.fill();
+  const tp = 1 + triesPulse*0.5;
+  ctx.fillStyle = tries > 0 ? '#FFC65C' : '#E0645A';
+  const label = tries === 1 ? '1 try' : `${tries} tries`;
+  let fsz = lcdH*0.5; ctx.font = `500 ${fsz}px Newsreader, Georgia, serif`;
+  const fit = (sr.w*0.68) / ctx.measureText(label).width; if (fit < 1) fsz *= fit;
+  ctx.font = `500 ${Math.round(fsz*tp)}px Newsreader, Georgia, serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(tries === 1 ? '1 try' : `${tries} tries`, sr.x+sr.w/2, sr.y+sr.h*0.08+lcdH*0.54);
+  const sx0 = sr.x+sr.w/2, sy0 = sr.y+sr.h*0.68;
+  ctx.fillStyle = '#C0B6B0'; ctx.beginPath(); ctx.roundRect(sx0-sr.w*0.22, sy0-sr.h*0.16, sr.w*0.44, sr.h*0.32, 5); ctx.fill();
+  ctx.fillStyle = '#2B2528'; ctx.beginPath(); ctx.roundRect(sx0-sr.w*0.035, sy0-sr.h*0.11, sr.w*0.07, sr.h*0.22, 2); ctx.fill();
+  if (tries === 0 && C.state === 'idle' && coinAnim < 0){
+    const gl = 0.35 + 0.35*Math.abs(Math.sin(T*0.004));
+    ctx.strokeStyle = `rgba(255,214,107,${gl.toFixed(2)})`; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.roundRect(sx0-sr.w*0.25, sy0-sr.h*0.19, sr.w*0.5, sr.h*0.38, 6); ctx.stroke();
+  }
+  // coin sliding into the slot
+  if (coinAnim >= 0){
+    const u = Math.min(1, coinAnim/0.5), cr = w*0.022;
+    const cy = sy0 - sr.h*0.55 + u*sr.h*0.5, squash = u > 0.7 ? 1 - (u-0.7)/0.3 : 1;
+    ctx.save(); ctx.beginPath(); ctx.rect(sr.x-w*0.05, sr.y-w*0.1, sr.w+w*0.1, (sy0 - (sr.y-w*0.1))); ctx.clip();
+    ctx.fillStyle = '#E8B84A'; ctx.beginPath(); ctx.ellipse(sx0, cy, cr*0.35*squash+cr*0.1, cr, 0, 0, 6.283); ctx.fill();
+    ctx.fillStyle = '#FFE08A'; ctx.beginPath(); ctx.ellipse(sx0-cr*0.08, cy-cr*0.2, cr*0.12, cr*0.5, 0, 0, 6.283); ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+  // prize door under the chute
+  const dx = x+w*0.12, dw = w*0.24, dy = py+ph*0.2, dh = ph*0.62;
+  ctx.fillStyle = '#3A3134'; ctx.beginPath(); ctx.roundRect(dx, dy, dw, dh, 6); ctx.fill();
+  const flap = flash > 0 ? Math.abs(Math.sin(flash*14))*dh*0.25 : 0;
+  ctx.fillStyle = 'rgba(210,230,240,0.55)'; ctx.beginPath(); ctx.roundRect(dx+3, dy+3+flap, dw-6, dh*0.55, 4); ctx.fill();
+  // grain over the cabinet
+  ctx.save(); ctx.beginPath(); ctx.roundRect(x, y, w, h, w*0.05); ctx.clip();
+  ctx.drawImage(grainC, x, y, w, h); ctx.restore();
+}
+function drawShelf(T){
+  if (!shelf.length) return;
+  const size = M.w*0.04, gap = size*2.6;
+  const total = (shelf.length-1)*gap, sx = M.x + M.w/2 - total/2, y = M.shelfY;
+  shelf.forEach((s,i) => {
+    s.t = Math.min(1, s.t + 0.04);
+    const k = 1 + Math.sin(s.t*Math.PI)*0.35;
+    ctx.save(); ctx.translate(sx + i*gap, y); ctx.scale(k*s.t, k*s.t);
+    drawPrizeShape(s.kind, size); ctx.restore();
+  });
+}
+
+/* ---------- loop ---------- */
+let last = performance.now();
+function frame(T){
+  const dt = Math.min(0.05,(T-last)/1000); last = T;
+  if (keys.ArrowLeft) C.tx = clamp(C.tx - dt*0.9, -0.92, 0.92);
+  if (keys.ArrowRight) C.tx = clamp(C.tx + dt*0.9, -0.92, 0.92);
+  if (keys.ArrowUp) C.tz = clamp(C.tz + dt*0.6, 0.05, 0.95);
+  if (keys.ArrowDown) C.tz = clamp(C.tz - dt*0.6, 0.05, 0.95);
+  C.press = Math.max(0, C.press - dt*4);
+  slotNudge = Math.max(0, slotNudge - dt); triesPulse = Math.max(0, triesPulse - dt);
+  if (coinAnim >= 0){ coinAnim += dt; if (coinAnim > 0.55){ coinAnim = -1; tries += 2; triesPulse = 0.4; } }
+
+  // carriage movement with a bit of lag, and the claw swinging on its cable
+  let gx = C.tx, gz = C.tz, spd = 1.3;
+  if (C.state === 'carry'){ gx = DROP_AT.x; gz = DROP_AT.z; spd = 0.8; }
+  const moving = C.state === 'idle' || C.state === 'carry';
+  const pvx = C.vx, pvz = C.vz;
+  if (moving){
+    const dx = gx - C.x, dz = gz - C.z, d = Math.hypot(dx,dz);
+    const v = Math.min(spd, d*6);
+    C.vx = d > 0.001 ? dx/d*v : 0; C.vz = d > 0.001 ? dz/d*v : 0;
+  } else { C.vx = 0; C.vz = 0; }
+  C.x += C.vx*dt; C.z += C.vz*dt;
+  const ax = (C.vx - pvx)/Math.max(dt,0.001), az = (C.vz - pvz)/Math.max(dt,0.001);
+  if (!reduce){
+    C.svx += (-60*C.swx - 5*C.svx - ax*0.025)*dt; C.svz += (-60*C.swz - 5*C.svz - az*0.025)*dt;
+    C.swx += C.svx*dt; C.swz += C.svz*dt;
+  }
+
+  if (C.state === 'idle'){
+    C.open = Math.min(1, C.open + dt/0.3);
+  } else if (C.state === 'down'){
+    C.y -= 0.9*dt;
+    const s = surf(C.x, C.z);
+    if (C.y <= s + 0.015 || C.y <= 0.02){ C.y = Math.max(C.y, 0.02); C.state = 'close'; }
+  } else if (C.state === 'close'){
+    C.open -= dt/0.35;
+    if (C.open <= 0){ C.open = 0; decideGrab(); C.state = 'up'; C.t0 = C.y; }
+  } else if (C.state === 'up'){
+    C.y += 0.7*dt;
+    if (C.held && C.slip && C.slip.phase === 'up' && (C.y - C.t0)/(YTOP - C.t0) > C.slip.at){ release(C.held, false); C.open = 0.4; fails++; }
+    if (C.y >= YTOP){
+      C.y = YTOP;
+      if (C.held){ C.state = 'carry'; C.carryFrom = Math.hypot(DROP_AT.x-C.x, DROP_AT.z-C.z) || 0.001; }
+      else { C.state = 'idle'; if (!C.slip) fails++; }
+    }
+  } else if (C.state === 'carry'){
+    const left = Math.hypot(DROP_AT.x-C.x, DROP_AT.z-C.z);
+    if (C.held && C.slip && C.slip.phase === 'carry' && 1 - left/C.carryFrom > C.slip.at){
+      const nearChute = left < 0.35; release(C.held, nearChute); C.open = 0.4; fails++;
+    }
+    if (left < 0.01){ C.state = 'release'; C.t = 0; }
+  } else if (C.state === 'release'){
+    C.t += dt; C.open = Math.min(1, C.t/0.3);
+    if (C.held && C.t > 0.12){ const p = C.held; release(p, false); p.vx = 0; p.vz = 0; p.toChute = true; }
+    if (C.t > 0.6){ C.state = 'idle'; }
+  }
+
+  // held prize hangs in the claw
+  if (C.held){
+    const p = C.held;
+    p.x = C.x + C.swx; p.z = C.z + C.swz; p.y = Math.max(0, C.y - p.h*0.35);
+  }
+  // falling prizes
+  for (const p of prizes){
+    if (!p.falling) continue;
+    p.vy -= 3.2*dt; p.y += p.vy*dt; p.x += p.vx*dt; p.z += p.vz*dt;
+    if (p.toChute){
+      if (p.y <= -0.02 && !p.win){ p.win = true; p.winT = 0; }
+    } else if (inChute(p.x, p.z, p.r*0.6) && p.y <= CHUTE.h + p.h*0.2){
+      // hit the chute's walls: bounce back out onto the floor
+      const ex = CHUTE.x1 + p.r*0.75 - p.x, ez = CHUTE.z1 + p.r*0.75 - p.z;
+      if (ex < ez){ p.x += ex; p.vx = Math.abs(p.vx) + 0.35; } else { p.z += ez; p.vz = Math.abs(p.vz) + 0.35; }
+      p.vy = Math.abs(p.vy)*0.35; p.y = Math.max(p.y, CHUTE.h*0.6);
+      p.rot += 0.6;
+    } else if (p.y <= 0){
+      p.y = 0;
+      if (p.vy < -0.6){ p.vy *= -0.3; } else { p.vy = 0; p.falling = false; }
+    }
+    if (p.win){
+      p.winT += dt; p.y -= dt*0.2;
+      if (p.winT > 0.5 && !p.gone){
+        p.gone = true; p.falling = false;
+        shelf.push({ kind: p.kind, t: 0 }); if (shelf.length > 8) shelf.shift();
+        fails = 0; flash = 1.4;
+        say(p.kind === 'golden' ? 'A golden duck?! Legendary.' : `You got the ${KINDS[p.kind].name}!`, 2.2);
+        setTimeout(() => { prizes = prizes.filter(q => !q.gone); refill(); }, 900);
+      }
+    }
+  }
+  separate(dt);
+  flash = Math.max(0, flash - dt);
+  if (msgT > 0){ msgT -= dt; if (msgT <= 0) msgEl.classList.remove('show'); }
+
+  ctx.clearRect(0,0,W,H);
+  drawCabinet(T);
+  drawShelf(T);
+  requestAnimationFrame(frame);
+}
+function refill(){
+  while (prizes.filter(p => !p.gone).length < 16){
+    let x, z; do { x = rnd(-0.8,0.8); z = rnd(0.2,0.9); } while (inChute(x,z,0.12));
+    prizes.push(makePrize(x, z, 0.9));
+  }
+}
+
+layout(); fillPrizes(16);
+requestAnimationFrame(t => { last = t; frame(t); });
+})();
+</script>
+</body>
+</html>
