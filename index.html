@@ -137,6 +137,10 @@ function slotRect(){
   const py = M.py, ph = M.y + M.h - M.w*0.07 - py;
   return { x: M.x+M.w*0.40, y: py+ph*0.12, w: M.w*0.15, h: ph*0.76 };
 }
+function buttonRect(){
+  const py = M.py, ph = M.y + M.h - M.w*0.07 - py;
+  return { x: M.x+M.w*0.72, y: py, w: M.w*0.2, h: ph };
+}
 const inRect = (px,py,r) => px >= r.x && px <= r.x+r.w && py >= r.y && py <= r.y+r.h;
 function decideGrab(){
   let best = null, bd = 1e9;
@@ -190,18 +194,37 @@ function layout(){
 let rt; addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(layout,150); });
 
 /* ---------- input ---------- */
+// Mouse: the claw follows the pointer and a click drops it.
+// Touch: dragging anywhere steers the claw (relative, so your finger never hides it),
+// and only the yellow button drops it.
+let drag = null;
 addEventListener('pointermove', e => {
-  const overSlot = inRect(e.clientX, e.clientY, slotRect());
-  cvs.style.cursor = overSlot ? 'pointer' : 'default';
-  if (overSlot) return;
-  const t = unproj(e.clientX, e.clientY); C.tx = t.x; C.tz = t.z;
+  if (e.pointerType === 'mouse'){
+    const overCtl = inRect(e.clientX, e.clientY, slotRect()) || inRect(e.clientX, e.clientY, buttonRect());
+    cvs.style.cursor = overCtl ? 'pointer' : 'default';
+    if (overCtl) return;
+    const t = unproj(e.clientX, e.clientY); C.tx = t.x; C.tz = t.z;
+  } else if (drag && e.pointerId === drag.id){
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    drag.x = e.clientX; drag.y = e.clientY;
+    C.tx = clamp(C.tx + dx/(M.hw*(1-0.28*C.tz))*1.3, -0.92, 0.92);
+    C.tz = clamp(C.tz + dy/(M.by - M.fy)*1.3, 0.05, 0.95);
+  }
 });
 addEventListener('pointerdown', e => {
   if (e.target.closest('a')) return;
   if (inRect(e.clientX, e.clientY, slotRect())){ insertCoin(); return; }
-  const t = unproj(e.clientX, e.clientY); C.tx = t.x; C.tz = t.z;
-  drop();
+  if (inRect(e.clientX, e.clientY, buttonRect())){ drop(); return; }
+  if (e.pointerType === 'mouse'){
+    const t = unproj(e.clientX, e.clientY); C.tx = t.x; C.tz = t.z;
+    drop();
+  } else {
+    drag = { id: e.pointerId, x: e.clientX, y: e.clientY };
+  }
 });
+const endDrag = e => { if (drag && e.pointerId === drag.id) drag = null; };
+addEventListener('pointerup', endDrag);
+addEventListener('pointercancel', endDrag);
 const keys = {};
 addEventListener('keydown', e => {
   if (e.code === 'Space' || e.code === 'Enter'){ e.preventDefault(); drop(); }
@@ -403,6 +426,8 @@ function drawCabinet(T){
   const bx2 = x+w*0.8, by2 = py+ph*0.5, sink = C.press*w*0.008;
   ctx.fillStyle = '#B94C3F'; ctx.beginPath(); ctx.ellipse(bx2, by2+w*0.01, w*0.04, w*0.022, 0, 0, 6.283); ctx.fill();
   ctx.fillStyle = '#F2C94C'; ctx.beginPath(); ctx.ellipse(bx2, by2+sink, w*0.036, w*0.019, 0, 0, 6.283); ctx.fill();
+  ctx.fillStyle = '#B25A4C'; ctx.font = `italic 400 ${Math.round(w*0.026)}px Newsreader, Georgia, serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText('drop', bx2, by2 + w*0.04);
   // tries display and coin slot
   const sr = slotRect(), nudge = slotNudge > 0 ? Math.sin(slotNudge*40)*w*0.006 : 0;
   ctx.save(); ctx.translate(nudge, 0);
